@@ -1441,5 +1441,32 @@ private fun KeyMintAttestation.toAuthorizations(
 
     authList.add(createKeystoreAuth(Tag.USER_ID, KeyParameterValue.integer(callingUid / 100000)))
 
+    // CERTIFICATE_NOT_BEFORE and CERTIFICATE_NOT_AFTER are emitted by real
+    // AOSP KeyMint reference TA at common/src/cert.rs as keystore-enforced
+    // authorizations on every attested key. Adding them aligns the
+    // characteristics list with real hardware AND, structurally, appends
+    // two `dateTime`-typed authorizations (unionTag=13, 8-byte payload) to
+    // the very end of the list. That breaks Duck-Detector's generate-mode
+    // parser's accumulated misalignment: the parser walks 12+payload-by-
+    // unionTag strides assuming pre-stable AIDL framing, then reads
+    // (lastSecLevel, lastUnionTag, modificationTimeMs) from offsets that
+    // depend on every prior auth's footprint. Trailing long-typed auths
+    // shift that final offset enough that none of the magic
+    // (256, 32, 0x100000001) bytes align.
+    val notBefore = certificateNotBefore?.time
+        ?: activeDateTime?.time
+        ?: System.currentTimeMillis()
+    authList.add(createKeystoreAuth(Tag.CERTIFICATE_NOT_BEFORE, KeyParameterValue.dateTime(notBefore)))
+    val notAfter = certificateNotAfter?.time
+        ?: originationExpireDateTime?.time
+        ?: usageExpireDateTime?.time
+        ?: (notBefore + DEFAULT_CERTIFICATE_VALIDITY_MILLIS)
+    authList.add(createKeystoreAuth(Tag.CERTIFICATE_NOT_AFTER, KeyParameterValue.dateTime(notAfter)))
+
     return authList.toTypedArray()
 }
+
+// 30 years — matches AOSP keymint default for keystore-generated certs
+// (`MAX_VALID_PERIOD_MS` in services/core/java/com/android/server/security/
+//  rkp/RemoteProvisioningService.java).
+private const val DEFAULT_CERTIFICATE_VALIDITY_MILLIS = 30L * 365 * 24 * 60 * 60 * 1000
