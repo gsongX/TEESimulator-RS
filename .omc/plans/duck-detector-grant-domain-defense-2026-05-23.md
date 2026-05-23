@@ -186,39 +186,104 @@ and ownerKeyId, regenerate grantId on restore.
 
 **What**: The attestation extension (OID `1.3.6.1.4.1.11129.2.1.17`) is
 re-encoded by BouncyCastle on every patched leaf. AOSP KeyMint reference
-TA emits the same extension via Rust `der` crate. The two encoders may
-differ on:
+TA emits the same extension via Rust `der` crate
+(`system/keymint/common/src/cert.rs`). The two encoders are
+**deterministically different** in ways that are **invariant across all real
+hardware**: any AOSP KeyMint TA on any device uses the same Rust code path,
+so an encoder-level difference detected on one Pixel is also true on every
+other real device. Examples:
 
+- AuthorizationList field emission order (driven by Rust struct field
+  declaration order vs our `teeEnforcedMap.values.sortedBy { it.tagNo }`)
+- Whether a field is emitted at OPTIONAL default values vs always omitted
+- Empty SET-OF handled as omitted-OPTIONAL vs written-empty
 - INTEGER minimal-byte encoding at boundary values
-- SET-OF element ordering (DER requires sort by encoded byte sequence,
-  not by tag number — we currently `sortedBy { it.tagNo }`)
-- OPTIONAL NULL omission vs explicit `NULL`
 - BIT STRING trailing pad-bit count
+- The `applicationId` / `attestationApplicationId` byte format
 
-**Risk**: medium. A probe that captures a real-hardware attestation extension
-once and SHA-256-prefixes the encoded bytes for comparison would see us
-diverge. None of the public Duck-Detector PRs do this yet.
+**Most damaging axis**: the *set* of fields emitted into `teeEnforced` vs
+`softwareEnforced`. Real KeyMint TA splits authorizations by the
+`KEYMINT_ENFORCED_CHARACTERISTICS` / `KEYSTORE_ENFORCED_CHARACTERISTICS`
+tables in `tag/info.rs`. Our `toAuthorizations` follows a different (and
+informally maintained) ruleset. Any single (algorithm, purpose,
+securityLevel) tuple where the two rulesets disagree is a one-shot
+fingerprint.
+
+**Attack cost — single real device is enough**: this attack does NOT need a
+device-database the way `os_patch_level` / `brand` / `device` content
+fingerprints do. A probe author needs only one un-tampered Pixel:
+
+1. Generate a key with chosen parameters → capture the attestation
+   extension bytes.
+2. Compare to the same key generated under TEESimulator-RS.
+3. The first encoder-level diff that is independent of
+   device-identifying fields becomes the fingerprint rule.
+
+That said, the **engineering effort** to write such a probe is comparable
+to PR #34 (generate-mode parcel fingerprint) — non-trivial ASN.1 decoding,
+AOSP source-code cross-reference, Android-version coverage. Duck-Detector
+has the skill but has so far preferred lower-effort cross-plane attacks.
+
+**Risk**: medium. Single-device discoverable, but high engineering cost to
+write the probe. Not currently exploited.
 
 **Fix when needed**: route attestation extension construction through the
 Rust `native-certgen` crate (which already exists for keypair generation)
-so the encoder matches AOSP's. Cost is non-trivial — requires moving
-`AttestationPatcher.createPatchedAttestationExtension` into Rust.
+so the encoder *and* the field-emission rules match AOSP byte-for-byte.
+Cost is non-trivial — requires moving
+`AttestationPatcher.createPatchedAttestationExtension` into Rust and
+mirroring the AOSP `KEYMINT_ENFORCED_CHARACTERISTICS` table exactly.
+
+**Note on response speed**: unlike GRANT/maintenance/parcel-fingerprint
+fixes, this one is hard to iterate against on-device because the probe
+itself does ASN.1 byte comparisons we cannot easily inspect from logcat.
+If this lands, expect a slower fix cycle.
+
+---
 
 **内容**：attestation extension（OID `1.3.6.1.4.1.11129.2.1.17`）在每张
 patched leaf 上由 BouncyCastle 重新编码。AOSP KeyMint reference TA 用 Rust
-`der` crate 出同样 extension。两个编码器可能在以下点有差异：
-- 边界值上 INTEGER 最小字节编码
-- SET-OF 元素排序（DER 要求按编码字节序排，不是 tag 号；我们目前用
-  `sortedBy { it.tagNo }`）
-- OPTIONAL NULL 省略 vs 显式 `NULL`
-- BIT STRING 末尾 pad-bit 计数
+`der` crate（`system/keymint/common/src/cert.rs`）。**两个编码器在某些细节上
+确定性不同，且这些不同不依赖具体设备** — 任意真机的 KeyMint TA 都跑同一份
+Rust 代码，所以"在一台 Pixel 上发现的编码差异"在所有真机上都成立。差异点举例：
 
-**风险**：中。探针抓一份真硬件 attestation extension 做 SHA-256 prefix 对比就
-能识破我们。Duck-Detector 公开 PR 目前都没这么打。
+- AuthorizationList 字段出现顺序（真硬件由 Rust struct 字段声明序决定，
+  我们由 `teeEnforcedMap.values.sortedBy { it.tagNo }` 决定）
+- OPTIONAL default 值时是否省略
+- 空 SET-OF 处理为"省略 OPTIONAL"还是"写空 SET"
+- 边界值上 INTEGER 最小字节编码
+- BIT STRING 末尾 pad-bit 计数
+- `applicationId` / `attestationApplicationId` 的精确字节格式
+
+**最致命**：`teeEnforced` / `softwareEnforced` 两个 list 中**字段集合本身**的
+划分。真 KeyMint TA 严格按照 `tag/info.rs` 里的
+`KEYMINT_ENFORCED_CHARACTERISTICS` / `KEYSTORE_ENFORCED_CHARACTERISTICS`
+表决定每个 tag 进哪个 list；我们的 `toAuthorizations` 是非正式维护的另一套
+规则。**任意一个 (algorithm, purpose, securityLevel) 组合下两套规则不一致**，
+就成为一击必中的指纹。
+
+**攻击成本——一台真机就够**：这条路**不需要**像 `os_patch_level` / `brand`
+/ `device` 那种内容指纹一样维护机型数据库。探针作者只需要一台没刷模块的
+Pixel：
+
+1. 用指定参数生成一把 key → 抓 attestation extension 字节
+2. 在装了 TEESimulator-RS 的设备上用同样参数重做一遍
+3. 找到第一个**与设备识别字段无关**的编码差异 → 这就是指纹规则
+
+但**写这种探针的工程量**和 PR #34（generate-mode parcel fingerprint）是同一级
+别 — 复杂的 ASN.1 解析、AOSP 源码交叉对照、不同 Android 版本的覆盖。
+Duck-Detector 团队有这个能力，但目前选了工程量更低的跨平面攻击路径。
+
+**风险**：中。**单机可发现**，但探针工程量高。当前未被利用。
 
 **真要修时**：把 attestation extension 构造移到 Rust 的 `native-certgen`
-crate（keypair 生成已经在那边），让编码器与 AOSP 一致。成本不小 — 要把
-`AttestationPatcher.createPatchedAttestationExtension` 移到 Rust。
+crate（keypair 生成已经在那边），让**编码器和字段划分规则**都按字节对齐
+AOSP。成本不小 — 要把 `AttestationPatcher.createPatchedAttestationExtension`
+移到 Rust，并精确镜像 AOSP `KEYMINT_ENFORCED_CHARACTERISTICS` 表。
+
+**关于响应速度的提醒**：和 GRANT / maintenance / parcel-fingerprint 不同，这
+条路的修复**很难靠装机迭代**——探针做的是 ASN.1 字节比较，logcat 里看不到。
+真出 PR 的话，预期修复周期会比之前几轮长。
 
 ### Gap D — `IKeystoreSecurityLevel.convertStorageKeyToEphemeral`
 
