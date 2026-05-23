@@ -16,6 +16,11 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      # Explicit read scope so actions/checkout's GITHUB_TOKEN can fetch the
+      # repository even when the repo's default workflow permissions are set
+      # to "restricted" (the new GitHub default for many accounts/orgs).
+      contents: read
 
     steps:
       - uses: actions/checkout@v4
