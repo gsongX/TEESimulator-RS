@@ -1157,6 +1157,15 @@ class KeyMintSecurityLevelInterceptor(
         private val usageCounters = ConcurrentHashMap<KeyIdentifier, java.util.concurrent.atomic.AtomicInteger>()
         private val interceptedOperations = ConcurrentHashMap<IBinder, OperationInterceptor>()
 
+        // grantId -> (ownerKeyId, granteeUid). Synthetic grants only — the real
+        // keystore2 grant table is not consulted, because software keys never
+        // existed there. We use a positive 63-bit id space so AOSP probes that
+        // print grantId via Long.toUnsignedString() see a normal-looking value.
+        private val softwareGrants = ConcurrentHashMap<Long, SoftwareGrant>()
+        private val softwareGrantIdGen = java.util.concurrent.atomic.AtomicLong(1L)
+
+        data class SoftwareGrant(val ownerKeyId: KeyIdentifier, val granteeUid: Int)
+
         fun getGeneratedKeyResponse(keyId: KeyIdentifier): KeyEntryResponse? =
             generatedKeys[keyId]?.response ?: teeResponses[keyId]
 
@@ -1180,6 +1189,77 @@ class KeyMintSecurityLevelInterceptor(
 
         fun isAttestationKey(keyId: KeyIdentifier): Boolean = attestationKeys.contains(keyId)
 
+        /**
+         * Locates the owner KeyIdentifier for a software-generated key when
+         * callers reference it via Domain.KEY_ID. Used by the grant/ungrant
+         * path to map back to the alias-keyed `generatedKeys` table.
+         */
+        fun findGeneratedOwnerKeyByKeyId(callingUid: Int, nspace: Long?): KeyIdentifier? {
+            if (nspace == null || nspace == 0L) return null
+            return generatedKeys.entries
+                .firstOrNull { (kid, info) -> kid.uid == callingUid && info.nspace == nspace }
+                ?.key
+        }
+
+        /**
+         * Issues a synthetic grantId mapped to a software-generated owner key.
+         * The grantId is stable for the lifetime of the owner key, so repeated
+         * grant() calls for the same (owner, grantee) pair return the same id —
+         * mirroring AOSP keystore2 behavior closely enough that probes cannot
+         * fingerprint us by reissue patterns.
+         */
+        fun issueSoftwareGrant(ownerKeyId: KeyIdentifier, granteeUid: Int): Long {
+            // Reuse an existing grantId for the same pair to avoid leaking the
+            // id space and to match AOSP keystore2 idempotence on repeat grants.
+            softwareGrants.entries
+                .firstOrNull { (_, grant) -> grant.ownerKeyId == ownerKeyId && grant.granteeUid == granteeUid }
+                ?.let { return it.key }
+            // Cap to 63 bits so Long.toUnsignedString reads the same as Long.toString.
+            val grantId = (softwareGrantIdGen.getAndIncrement()) and 0x7fffffffffffffffL
+            softwareGrants[grantId] = SoftwareGrant(ownerKeyId, granteeUid)
+            return grantId
+        }
+
+        /** Drops every grant pointing at the given owner key. */
+        fun revokeSoftwareGrantsForOwner(ownerKeyId: KeyIdentifier): Int {
+            val ids = softwareGrants.entries
+                .filter { it.value.ownerKeyId == ownerKeyId }
+                .map { it.key }
+            ids.forEach { softwareGrants.remove(it) }
+            return ids.size
+        }
+
+        /** Drops grants matching (owner, grantee). Returns how many were removed. */
+        fun revokeSoftwareGrant(ownerKeyId: KeyIdentifier, granteeUid: Int): Int {
+            val ids = softwareGrants.entries
+                .filter { it.value.ownerKeyId == ownerKeyId && it.value.granteeUid == granteeUid }
+                .map { it.key }
+            ids.forEach { softwareGrants.remove(it) }
+            return ids.size
+        }
+
+        /**
+         * Resolves a Domain.GRANT readback to the owner's KeyEntryResponse.
+         * Returning the same response keeps the GRANT plane structurally
+         * indistinguishable from APP / KEY_ID for software keys.
+         */
+        fun resolveGrantedResponse(grantId: Long): KeyEntryResponse? {
+            val grant = softwareGrants[grantId] ?: return null
+            return getGeneratedKeyResponse(grant.ownerKeyId)
+        }
+
+        /**
+         * Defensive: drops a stale `patchedChains` entry without touching the
+         * authoritative `teeResponses` / `generatedKeys` tables. Used after
+         * updateSubcomponent so detection probes cannot replay pre-update
+         * fingerprints from any path.
+         */
+        fun invalidatePatchedChainFor(keyId: KeyIdentifier) {
+            if (patchedChains.remove(keyId) != null) {
+                SystemLogger.debug("Invalidated patched chain for $keyId after subcomponent update")
+            }
+        }
+
         fun cleanupKeyData(keyId: KeyIdentifier) {
             if (generatedKeys.remove(keyId) != null) {
                 SystemLogger.debug("Remove generated key ${keyId}")
@@ -1194,6 +1274,12 @@ class KeyMintSecurityLevelInterceptor(
             }
             importedKeys.remove(keyId)
             usageCounters.remove(keyId)
+            // Drop synthetic grants that referenced this owner so a stale grantId
+            // can never resolve to a recycled owner alias later.
+            val droppedGrants = revokeSoftwareGrantsForOwner(keyId)
+            if (droppedGrants > 0) {
+                SystemLogger.debug("Dropped $droppedGrants synthetic grants for $keyId")
+            }
         }
 
         fun removeOperationInterceptor(operationBinder: IBinder, backdoor: IBinder) {
@@ -1221,6 +1307,7 @@ class KeyMintSecurityLevelInterceptor(
             attestationKeys.clear()
             importedKeys.clear()
             usageCounters.clear()
+            softwareGrants.clear()
             GeneratedKeyPersistence.deleteAll()
             SystemLogger.info("Cleared all cached keys ($count entries)$reasonMessage.")
         }

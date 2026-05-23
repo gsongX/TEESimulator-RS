@@ -48,6 +48,19 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
         else null
     private val GET_NUMBER_OF_ENTRIES_TRANSACTION =
         InterceptorUtils.getTransactCode(stubBinderClass, "getNumberOfEntries")
+    // grant/ungrant exist on every Android 12+ IKeystoreService binder. They were
+    // not previously intercepted because regular AOSP apps do not call them, but
+    // detection probes do — exercising Domain.GRANT after generateKey/getKeyEntry
+    // already returned our patched chain. Without a same-source response from the
+    // GRANT plane, real keystore2 sees the alias as nonexistent and replies with
+    // KEY_NOT_FOUND, which is a structural cross-plane divergence regardless of
+    // any specific probe wording. We resolve the GRANT path the same way we
+    // resolve KEY_ID — by serving the same KeyEntryResponse — so APP / KEY_ID /
+    // GRANT all share one source of truth for software-generated keys.
+    private val GRANT_TRANSACTION =
+        InterceptorUtils.getTransactCode(stubBinderClass, "grant")
+    private val UNGRANT_TRANSACTION =
+        InterceptorUtils.getTransactCode(stubBinderClass, "ungrant")
 
     private val transactionNames: Map<Int, String> by lazy {
         stubBinderClass.declaredFields
@@ -80,6 +93,8 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                 LIST_ENTRIES_TRANSACTION,
                 LIST_ENTRIES_BATCHED_TRANSACTION,
                 GET_NUMBER_OF_ENTRIES_TRANSACTION,
+                GRANT_TRANSACTION.takeIf { it != -1 },
+                UNGRANT_TRANSACTION.takeIf { it != -1 },
             )
             .toIntArray()
     }
@@ -246,6 +261,19 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                         )
                         return InterceptorUtils.createTypedObjectReply(teeResp)
                     }
+                } else if (descriptor.domain == Domain.GRANT) {
+                    // Domain.GRANT carries a synthetic grantId in nspace. If the
+                    // grant was issued by us against a software-generated owner
+                    // alias, return the owner's exact KeyEntryResponse — same
+                    // metadata, same patched chain. This keeps APP, KEY_ID, and
+                    // GRANT planes byte-identical for software keys, which is
+                    // the structural invariant any grant-plane probe verifies.
+                    KeyMintSecurityLevelInterceptor.resolveGrantedResponse(descriptor.nspace)?.let { resp ->
+                        SystemLogger.info(
+                            "[TX_ID: $txId] Found generated response via GRANT grantId=${descriptor.nspace}"
+                        )
+                        return InterceptorUtils.createTypedObjectReply(resp)
+                    }
                 }
                 return TransactionResult.ContinueAndSkipPost
             }
@@ -268,6 +296,12 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                 KeyMintParameterLogger.logParameter(it.keyParameter)
             }
             return InterceptorUtils.createTypedObjectReply(response)
+        } else if (code == GRANT_TRANSACTION || code == UNGRANT_TRANSACTION) {
+            logTransaction(txId, transactionNames[code] ?: "code=$code", callingUid, callingPid)
+            if (ConfigurationManager.shouldSkipUid(callingUid))
+                return TransactionResult.ContinueAndSkipPost
+            return if (code == GRANT_TRANSACTION) handleGrant(txId, callingUid, data)
+            else handleUngrant(txId, callingUid, data)
         } else {
             logTransaction(
                 txId,
@@ -543,6 +577,17 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
         metadata.certificate = publicCert
         metadata.certificateChain = certificateChain
 
+        // Defensive: evict the prior patched chain so any subsequent KEY_ID /
+        // GRANT readback can never replay a SHA-256 fingerprint from before
+        // the update. Without this, KeyMintSecurityLevelInterceptor.patchedChains
+        // still holds the pre-update chain, which a probe could attribute to
+        // stale TEE response persistence.
+        val ownerKeyId = descriptor.alias?.let { KeyIdentifier(callingUid, it) }
+            ?: KeyMintSecurityLevelInterceptor.generatedKeys.entries.firstOrNull {
+                it.key.uid == callingUid && it.value.nspace == generatedKeyInfo.nspace
+            }?.key
+        ownerKeyId?.let { KeyMintSecurityLevelInterceptor.invalidatePatchedChainFor(it) }
+
         GeneratedKeyPersistence.rePersistIfNeeded(callingUid, generatedKeyInfo)
 
         SystemLogger.verbose(
@@ -550,5 +595,94 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
         )
 
         return InterceptorUtils.createSuccessReply(writeResultCode = false)
+    }
+
+    /**
+     * Handles `IKeystoreService.grant(KeyDescriptor, granteeUid)`.
+     *
+     * For software-generated owner aliases we issue a synthetic grantId and
+     * store the mapping `grantId -> ownerKeyId`. Subsequent
+     * `getKeyEntry(Domain.GRANT, grantId)` calls then resolve to the same
+     * KeyEntryResponse the owner sees, keeping the GRANT plane structurally
+     * consistent with the APP / KEY_ID planes for software keys.
+     *
+     * For non-software keys we forward to real keystore2 unchanged, since the
+     * AOSP grant path can resolve them legitimately.
+     */
+    private fun handleGrant(txId: Long, callingUid: Int, data: Parcel): TransactionResult {
+        return runCatching {
+            data.enforceInterface(IKeystoreService.DESCRIPTOR)
+            val descriptor = data.readTypedObject(KeyDescriptor.CREATOR)
+                ?: return@runCatching TransactionResult.ContinueAndSkipPost
+            val granteeUid = data.readInt()
+            // accessVector is the third arg; we do not need it because software
+            // keys do not enforce per-grant permission masks here.
+
+            val ownerKeyId = resolveOwnerKeyId(callingUid, descriptor) ?: run {
+                SystemLogger.debug(
+                    "[TX_ID: $txId] grant for non-software key (domain=${descriptor.domain} alias=${descriptor.alias} nspace=${descriptor.nspace}); forwarding."
+                )
+                return@runCatching TransactionResult.ContinueAndSkipPost
+            }
+
+            val grantId = KeyMintSecurityLevelInterceptor.issueSoftwareGrant(ownerKeyId, granteeUid)
+            SystemLogger.info(
+                "[TX_ID: $txId] Issued software grant for $ownerKeyId -> uid=$granteeUid grantId=$grantId"
+            )
+
+            val granted = KeyDescriptor().apply {
+                domain = Domain.GRANT
+                nspace = grantId
+                alias = null
+                blob = null
+            }
+            InterceptorUtils.createTypedObjectReply(granted)
+        }.getOrElse {
+            SystemLogger.error("[TX_ID: $txId] Failed to handle grant", it)
+            // On any failure, forward to real keystore2 so we never become a
+            // detection vector ourselves by inventing inconsistent replies.
+            TransactionResult.ContinueAndSkipPost
+        }
+    }
+
+    /**
+     * Handles `IKeystoreService.ungrant(KeyDescriptor, granteeUid)`.
+     *
+     * If the descriptor matches a software-generated owner alias we synthesize
+     * a successful reply and drop the synthetic grant entry. Otherwise we
+     * forward to real keystore2.
+     */
+    private fun handleUngrant(txId: Long, callingUid: Int, data: Parcel): TransactionResult {
+        return runCatching {
+            data.enforceInterface(IKeystoreService.DESCRIPTOR)
+            val descriptor = data.readTypedObject(KeyDescriptor.CREATOR)
+                ?: return@runCatching TransactionResult.ContinueAndSkipPost
+            val granteeUid = data.readInt()
+
+            val ownerKeyId = resolveOwnerKeyId(callingUid, descriptor) ?: run {
+                return@runCatching TransactionResult.ContinueAndSkipPost
+            }
+
+            val removed = KeyMintSecurityLevelInterceptor.revokeSoftwareGrant(ownerKeyId, granteeUid)
+            SystemLogger.info(
+                "[TX_ID: $txId] Revoked software grants for $ownerKeyId -> uid=$granteeUid count=$removed"
+            )
+            InterceptorUtils.createSuccessReply(writeResultCode = false)
+        }.getOrElse {
+            SystemLogger.error("[TX_ID: $txId] Failed to handle ungrant", it)
+            TransactionResult.ContinueAndSkipPost
+        }
+    }
+
+    private fun resolveOwnerKeyId(callingUid: Int, descriptor: KeyDescriptor): KeyIdentifier? {
+        return when (descriptor.domain) {
+            Domain.APP -> descriptor.alias?.let { alias ->
+                val kid = KeyIdentifier(callingUid, alias)
+                if (KeyMintSecurityLevelInterceptor.getGeneratedKeyResponse(kid) != null) kid else null
+            }
+            Domain.KEY_ID -> KeyMintSecurityLevelInterceptor
+                .findGeneratedOwnerKeyByKeyId(callingUid, descriptor.nspace)
+            else -> null
+        }
     }
 }
