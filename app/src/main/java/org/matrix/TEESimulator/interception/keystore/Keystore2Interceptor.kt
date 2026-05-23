@@ -106,6 +106,34 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
     override fun onInterceptorReady(service: IBinder, backdoor: IBinder) {
         val keystoreInterface = IKeystoreService.Stub.asInterface(service)
         setupSecurityLevelInterceptors(keystoreInterface, backdoor)
+        setupMaintenanceInterceptor(backdoor)
+    }
+
+    /**
+     * Hook `IKeystoreMaintenance` so software-key cache stays consistent when callers use
+     * `clearNamespace` / `deleteAllKeys` / `onUserRemoved` / `migrateKeyNamespace`. The maintenance
+     * service runs in the same `keystore2` process, so the same backdoor binder is reusable.
+     */
+    private fun setupMaintenanceInterceptor(backdoor: IBinder) {
+        runCatching {
+            val maintenance = android.os.ServiceManager.getService(
+                "android.security.maintenance"
+            ) ?: return@runCatching
+            val codes = Keystore2MaintenanceInterceptor.INTERCEPTED_CODES
+            if (codes.isEmpty()) {
+                SystemLogger.warning(
+                    "IKeystoreMaintenance has no resolvable transaction codes on this build; skip."
+                )
+                return@runCatching
+            }
+            register(backdoor, maintenance, Keystore2MaintenanceInterceptor, codes)
+            SystemLogger.info("Registered IKeystoreMaintenance interceptor (${codes.size} codes).")
+        }.onFailure {
+            // Maintenance interception is supplementary, not load-bearing — never crash the
+            // main daemon when this fails. Probes may then observe a maintenance-vs-getKeyEntry
+            // divergence on broken devices, but that is preferable to total interceptor death.
+            SystemLogger.error("Failed to intercept IKeystoreMaintenance.", it)
+        }
     }
 
     private fun setupSecurityLevelInterceptors(service: IKeystoreService, backdoor: IBinder) {
