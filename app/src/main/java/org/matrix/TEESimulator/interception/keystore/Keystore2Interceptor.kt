@@ -218,6 +218,37 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
         ) {
             logTransaction(txId, transactionNames[code]!!, callingUid, callingPid)
 
+            // Domain.GRANT readbacks must be honored regardless of UID skip:
+            // grantee processes (especially isolated_app UID 99000-99999) have no
+            // package binding, so shouldSkipUid is always true for them. If we early
+            // return here, the call falls through to real keystore2, which has no
+            // record of our synthetic grantId and replies with KEY_NOT_FOUND. That
+            // is exactly the ISOLATED_PRIVATE_READBACK_CRASH signature Duck-Detector
+            // PR 553e3fe added on 2026-05-26 to flag isolated grant-domain probes
+            // as a WARN. Resolve the GRANT plane up front before any skip check so
+            // every caller sees the owner's same KeyEntryResponse.
+            if (code == GET_KEY_ENTRY_TRANSACTION) {
+                val rewindMark = data.dataPosition()
+                val grantHit = runCatching {
+                    data.enforceInterface(IKeystoreService.DESCRIPTOR)
+                    val descriptor = data.readTypedObject(KeyDescriptor.CREATOR)
+                    if (descriptor != null &&
+                        descriptor.alias == null &&
+                        descriptor.domain == Domain.GRANT) {
+                        KeyMintSecurityLevelInterceptor
+                            .resolveGrantedResponse(descriptor.nspace)
+                    } else null
+                }.getOrNull()
+                if (grantHit != null) {
+                    SystemLogger.info(
+                        "[TX_ID: $txId] Found generated response via GRANT grantId=" +
+                            "(uid=$callingUid pre-skip)"
+                    )
+                    return InterceptorUtils.createTypedObjectReply(grantHit)
+                }
+                data.setDataPosition(rewindMark)
+            }
+
             if (ConfigurationManager.shouldSkipUid(callingUid))
                 return TransactionResult.ContinueAndSkipPost
 
@@ -290,15 +321,15 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                         return InterceptorUtils.createTypedObjectReply(teeResp)
                     }
                 } else if (descriptor.domain == Domain.GRANT) {
-                    // Domain.GRANT carries a synthetic grantId in nspace. If the
-                    // grant was issued by us against a software-generated owner
-                    // alias, return the owner's exact KeyEntryResponse — same
-                    // metadata, same patched chain. This keeps APP, KEY_ID, and
-                    // GRANT planes byte-identical for software keys, which is
-                    // the structural invariant any grant-plane probe verifies.
+                    // Defense-in-depth: the upfront GRANT resolver right after the
+                    // GET_KEY_ENTRY_TRANSACTION dispatch already handles this case
+                    // for every UID (including isolated_app). We keep this branch
+                    // as a backup in case the upfront parcel rewind ever fails on
+                    // an exotic AOSP fork where data.setDataPosition is not
+                    // idempotent. Cheap and harmless to leave here.
                     KeyMintSecurityLevelInterceptor.resolveGrantedResponse(descriptor.nspace)?.let { resp ->
                         SystemLogger.info(
-                            "[TX_ID: $txId] Found generated response via GRANT grantId=${descriptor.nspace}"
+                            "[TX_ID: $txId] Found generated response via GRANT grantId=${descriptor.nspace} (post-skip fallback)"
                         )
                         return InterceptorUtils.createTypedObjectReply(resp)
                     }
