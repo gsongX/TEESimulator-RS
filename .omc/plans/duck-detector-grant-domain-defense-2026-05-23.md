@@ -14,6 +14,9 @@ Duck-Detector PRs #34 / #38 / #43. **Defense intentionally stopped here** — se
 ## Branch state / 分支状态
 
 ```text
+de693c0 fix(intercept): resolve Domain.GRANT readback before UID skip check
+5d30165 docs(plans): clarify Gap C attack cost and response constraints
+bcbd730 docs(plans): finalize duck-detector grant-domain defense handoff
 e820c94 feat(intercept): hook IKeystoreMaintenance for software-key cache parity
 b05b79e fix(intercept): emit CERTIFICATE_NOT_BEFORE/AFTER as keystore-enforced auths
 cbc7f51 ci(build): grant explicit read permission to checkout
@@ -61,7 +64,7 @@ software-key alias sees one source of truth.
 |---|---|
 | `IKeystoreService.getKeyEntry(APP, alias)` | ✅ patched chain returned (existing) |
 | `IKeystoreService.getKeyEntry(KEY_ID, nspace)` | ✅ resolves to same response |
-| `IKeystoreService.getKeyEntry(GRANT, grantId)` | ✅ resolves to owner's response (`21b2e4a`) |
+| `IKeystoreService.getKeyEntry(GRANT, grantId)` | ✅ resolves to owner's response — upfront, **before** UID-skip check (`21b2e4a` + `de693c0`) |
 | `IKeystoreService.deleteKey` | ✅ existing, drops cache + grants (`21b2e4a` extension) |
 | `IKeystoreService.updateSubcomponent` | ✅ updates leaf+chain in-place, evicts stale `patchedChains` (`21b2e4a`) |
 | `IKeystoreService.grant` / `ungrant` | ✅ synthetic `softwareGrants` table (`21b2e4a`) |
@@ -329,6 +332,80 @@ without an actual probe.
 **真要修时**：要往 HAL 进程本身注入（不同于 keystore2）并在那边复制
 `generateKey` / `deleteKey` / `getKeyCharacteristics` 缓存。工程量大。
 **没有具体探针不要起步**。
+
+---
+
+## Lessons from the 2026-05-25 incident / 2026-05-25 复盘
+
+Duck-Detector PR `553e3fe` (2026-05-26) added two attack vectors. One we
+fixed (`de693c0`), one we cannot fix in code:
+
+PR `553e3fe`（2026-05-26）增加了两条新攻击点。一条已修（`de693c0`），一条无法在代码层修复：
+
+### 1. ISOLATED_PRIVATE_READBACK_CRASH — fixed in de693c0
+
+The probe binder-transacts `getKeyEntry(GRANT, grantId)` from an isolated
+process whose UID is in 99000-99999 and matches the resulting keystore2
+crash stack
+(`No legacy keys for key descriptor / Error::Rc(r#KEY_NOT_FOUND) /
+service.rs:157: while trying to load key info`).
+
+Our 21b2e4a GRANT unification missed this case because
+`Keystore2Interceptor.onPreTransact` runs `shouldSkipUid` before
+dispatching to the GRANT resolver. Isolated UIDs have no package binding,
+so `shouldSkipUid` always returns true for them and the call falls
+through to real keystore2, which never registered our synthetic grantId.
+
+**Lesson — single-source-of-truth invariants must apply to every UID that
+touches the surface, not just the UIDs we have configured in
+target.txt.** When a defense's invariant is "every reader sees the same
+response", `shouldSkipUid`-style filters must come *after* the
+invariant-resolving lookup, not before. The fix moves the GRANT resolver
+ahead of the UID-skip check; if `softwareGrants` has the grantId, we
+serve the owner's response no matter who is calling.
+
+**经验**：当一个防御的不变性是"每个读者看到同样的响应"时，
+`shouldSkipUid` 过滤器必须放在不变性查询**之后**，不能放在之前。否则 isolated
+process / 系统服务 / 任何不在 target.txt 配置里的 UID 都会走真实路径，把同一表面
+撕成两个不一致的视图。
+
+### 2. Hardcoded keybox serial revocation — not fixable in code
+
+PR 553e3fe also added the EC leaf serial `8616ef30679ed43cc2b43e3c97a2319e`
+of the project's bundled `keybox.xml` (`@Xiaomi_Lei_Jun` keybox) to
+`tee_attestation_status.json` as a `KEY_COMPROMISE` entry. PR also wired
+`mergeOnlineEntries` so this revocation cannot be downgraded by the
+online feed — the local hardcoded list is the new revocation floor. So
+both online and offline scans now match this serial as revoked
+regardless of network state.
+
+This is reverse-engineering then static blacklisting, not a technical
+fingerprint we can defeat in the interceptor. Any keybox that gets
+publicly distributed will eventually land on this list. Mitigation
+options live outside of code:
+
+PR 同时把项目自带的 `@Xiaomi_Lei_Jun` keybox EC leaf serial
+`8616ef30679ed43cc2b43e3c97a2319e` 加进 `tee_attestation_status.json` 标为
+`KEY_COMPROMISE`，并通过 `mergeOnlineEntries` 让在线源无法降级它。**联网/离线
+扫描都会匹配这条 serial 命中红卡。**这是**反向工程后静态黑名单**，不是技术指纹，
+不能在 interceptor 里绕。任何被公开流通的 keybox 早晚都会进这张表。能做的事情
+只在代码外：
+
+- Keep `customize.sh`'s idempotent install logic (already in place,
+  `module/customize.sh:85-89`) so a user-supplied keybox at
+  `/data/adb/tricky_store/keybox.xml` is never overwritten on module
+  upgrade. 保持 `customize.sh` 的幂等安装逻辑，让用户自带 keybox 不被升级覆盖。
+- Document in README that the bundled keybox is for demonstration and
+  **will trigger Duck-Detector / PI revocation matches**; users who want
+  clean attestation must supply their own. 在 README 写明自带 keybox 仅供演示，
+  会被列黑；用户需自备未泄露的 keybox。
+- Consider a startup self-check that hashes the leaf serial of the
+  active keybox against a small embedded "known-blacklisted" list and
+  emits a warning into logcat. Implementation deferred — would require
+  shipping (and maintaining) our own copy of Duck-Detector's blacklist,
+  which is fragile. 可选：启动时自检 active keybox leaf serial，命中已知黑名单
+  时只输出 warning。延后——需要我们自己镜像并维护一份 Duck-Detector 黑名单，
+  脆弱。
 
 ---
 
