@@ -1162,7 +1162,19 @@ class KeyMintSecurityLevelInterceptor(
         // existed there. We use a positive 63-bit id space so AOSP probes that
         // print grantId via Long.toUnsignedString() see a normal-looking value.
         private val softwareGrants = ConcurrentHashMap<Long, SoftwareGrant>()
-        private val softwareGrantIdGen = java.util.concurrent.atomic.AtomicLong(1L)
+        // Seed the counter in the upper half of the positive 63-bit range so our
+        // synthetic IDs cannot collide with real keystore2 grant IDs at the low
+        // end where vendor TAs are most likely to land. Without this, callers
+        // outside our target list (e.g., the fingerprint engineering-mode probe)
+        // can call getKeyEntry(Domain.GRANT, realGrantId) and have us mis-
+        // resolve the small real ID into one of our cached owner responses —
+        // exactly the cross-UID failure mode that broke "Ultrasonic.Fingerprint
+        // cali hash get" on 2026-05-26. The cross-grantee guard in
+        // resolveGrantedResponse is the authoritative defense; this seeding is
+        // a probabilistic backup that drops collision odds to ~1/2^62 per grant.
+        private val softwareGrantIdGen = java.util.concurrent.atomic.AtomicLong(
+            (secureRandom.nextLong() and 0x3fff_ffff_ffff_ffffL) or 0x4000_0000_0000_0000L
+        )
 
         data class SoftwareGrant(val ownerKeyId: KeyIdentifier, val granteeUid: Int)
 
@@ -1239,12 +1251,26 @@ class KeyMintSecurityLevelInterceptor(
         }
 
         /**
-         * Resolves a Domain.GRANT readback to the owner's KeyEntryResponse.
-         * Returning the same response keeps the GRANT plane structurally
-         * indistinguishable from APP / KEY_ID for software keys.
+         * Resolves a Domain.GRANT readback to the owner's KeyEntryResponse only
+         * when the caller is the recorded grantee. Returning the same response
+         * keeps the GRANT plane structurally indistinguishable from APP / KEY_ID
+         * for software keys. The grantee-UID guard prevents synthetic IDs from
+         * being mis-resolved when a real grantId issued by hardware keystore2
+         * happens to collide with our id space (vendor TAs and engineering-mode
+         * probes call getKeyEntry(GRANT, realGrantId) for grants we know
+         * nothing about; without the UID guard we would serve the wrong cached
+         * owner response and break legitimate vendor flows like Ultrasonic
+         * Fingerprint calibration hash retrieval).
          */
-        fun resolveGrantedResponse(grantId: Long): KeyEntryResponse? {
+        fun resolveGrantedResponse(grantId: Long, callingUid: Int): KeyEntryResponse? {
             val grant = softwareGrants[grantId] ?: return null
+            if (grant.granteeUid != callingUid) {
+                SystemLogger.debug(
+                    "GRANT lookup grantId=$grantId by uid=$callingUid does not match " +
+                        "recorded grantee uid=${grant.granteeUid}; forwarding."
+                )
+                return null
+            }
             return getGeneratedKeyResponse(grant.ownerKeyId)
         }
 

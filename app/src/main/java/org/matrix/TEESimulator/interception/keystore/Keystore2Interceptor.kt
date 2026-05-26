@@ -226,7 +226,14 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
             // is exactly the ISOLATED_PRIVATE_READBACK_CRASH signature Duck-Detector
             // PR 553e3fe added on 2026-05-26 to flag isolated grant-domain probes
             // as a WARN. Resolve the GRANT plane up front before any skip check so
-            // every caller sees the owner's same KeyEntryResponse.
+            // every recorded grantee sees the owner's same KeyEntryResponse.
+            //
+            // The resolver is grantee-bound: only the UID we recorded at grant()
+            // time is served from the synthetic table. Foreign callers (vendor
+            // TAs, the engineering-mode fingerprint daemon) calling getKeyEntry
+            // (Domain.GRANT, realGrantId) for a grant we never issued fall
+            // through to real keystore2 unchanged, even if their realGrantId
+            // accidentally collides with one of ours.
             if (code == GET_KEY_ENTRY_TRANSACTION) {
                 val rewindMark = data.dataPosition()
                 val grantHit = runCatching {
@@ -236,7 +243,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                         descriptor.alias == null &&
                         descriptor.domain == Domain.GRANT) {
                         KeyMintSecurityLevelInterceptor
-                            .resolveGrantedResponse(descriptor.nspace)
+                            .resolveGrantedResponse(descriptor.nspace, callingUid)
                     } else null
                 }.getOrNull()
                 if (grantHit != null) {
@@ -327,7 +334,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                     // as a backup in case the upfront parcel rewind ever fails on
                     // an exotic AOSP fork where data.setDataPosition is not
                     // idempotent. Cheap and harmless to leave here.
-                    KeyMintSecurityLevelInterceptor.resolveGrantedResponse(descriptor.nspace)?.let { resp ->
+                    KeyMintSecurityLevelInterceptor.resolveGrantedResponse(descriptor.nspace, callingUid)?.let { resp ->
                         SystemLogger.info(
                             "[TX_ID: $txId] Found generated response via GRANT grantId=${descriptor.nspace} (post-skip fallback)"
                         )
