@@ -234,26 +234,45 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
             // (Domain.GRANT, realGrantId) for a grant we never issued fall
             // through to real keystore2 unchanged, even if their realGrantId
             // accidentally collides with one of ours.
+            //
+            // Performance note: when the upfront parse succeeds (the common case
+            // on every device that supports stable AIDL parcelables), we keep the
+            // already-parsed descriptor and reuse it below instead of rewinding
+            // and re-parsing. This shaves the descriptor enforce+readTypedObject
+            // pair from the hot getKeyEntry path. Only on parse failure do we
+            // rewind and let the downstream block reparse from scratch.
+            var prefetchedDescriptor: KeyDescriptor? = null
+            var prefetchedDescriptorParsed = false
             if (code == GET_KEY_ENTRY_TRANSACTION) {
                 val rewindMark = data.dataPosition()
-                val grantHit = runCatching {
+                val parseResult = runCatching {
                     data.enforceInterface(IKeystoreService.DESCRIPTOR)
-                    val descriptor = data.readTypedObject(KeyDescriptor.CREATOR)
-                    if (descriptor != null &&
-                        descriptor.alias == null &&
-                        descriptor.domain == Domain.GRANT) {
-                        KeyMintSecurityLevelInterceptor
-                            .resolveGrantedResponse(descriptor.nspace, callingUid)
-                    } else null
-                }.getOrNull()
-                if (grantHit != null) {
-                    SystemLogger.info(
-                        "[TX_ID: $txId] Found generated response via GRANT grantId=" +
-                            "(uid=$callingUid pre-skip)"
-                    )
-                    return InterceptorUtils.createTypedObjectReply(grantHit)
+                    data.readTypedObject(KeyDescriptor.CREATOR)
                 }
-                data.setDataPosition(rewindMark)
+                if (parseResult.isFailure) {
+                    // Parser threw on this build's parcel layout; rewind so the
+                    // downstream block can take its own shot at it.
+                    data.setDataPosition(rewindMark)
+                } else {
+                    prefetchedDescriptor = parseResult.getOrNull()
+                    prefetchedDescriptorParsed = true
+                    if (prefetchedDescriptor != null &&
+                        prefetchedDescriptor.alias == null &&
+                        prefetchedDescriptor.domain == Domain.GRANT) {
+                        val grantHit = KeyMintSecurityLevelInterceptor
+                            .resolveGrantedResponse(prefetchedDescriptor.nspace, callingUid)
+                        if (grantHit != null) {
+                            SystemLogger.info(
+                                "[TX_ID: $txId] Found generated response via GRANT grantId=" +
+                                    "(uid=$callingUid pre-skip)"
+                            )
+                            return InterceptorUtils.createTypedObjectReply(grantHit)
+                        }
+                        // Foreign GRANT (no synthetic table entry) — fall through.
+                        // The post-skip GRANT branch below is harmless because the
+                        // resolver will return null for the same (grantId,uid) pair.
+                    }
+                }
             }
 
             if (ConfigurationManager.shouldSkipUid(callingUid))
@@ -262,10 +281,13 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
             if (code == UPDATE_SUBCOMPONENT_TRANSACTION)
                 return handleUpdateSubcomponent(callingUid, data)
 
-            data.enforceInterface(IKeystoreService.DESCRIPTOR)
-            val descriptor =
+            val descriptor = if (prefetchedDescriptorParsed) {
+                prefetchedDescriptor ?: return TransactionResult.ContinueAndSkipPost
+            } else {
+                data.enforceInterface(IKeystoreService.DESCRIPTOR)
                 data.readTypedObject(KeyDescriptor.CREATOR)
                     ?: return TransactionResult.ContinueAndSkipPost
+            }
 
             if (code == DELETE_KEY_TRANSACTION) {
                 val keyId =
