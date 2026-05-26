@@ -64,7 +64,7 @@ software-key alias sees one source of truth.
 |---|---|
 | `IKeystoreService.getKeyEntry(APP, alias)` | ✅ patched chain returned (existing) |
 | `IKeystoreService.getKeyEntry(KEY_ID, nspace)` | ✅ resolves to same response |
-| `IKeystoreService.getKeyEntry(GRANT, grantId)` | ✅ resolves to owner's response — upfront, **before** UID-skip check (`21b2e4a` + `de693c0`) |
+| `IKeystoreService.getKeyEntry(GRANT, grantId)` | ✅ resolves to owner's response — upfront, **before** UID-skip check; resolver is grantee-bound so foreign callers fall through (`21b2e4a` + `de693c0` + 2026-05-26 cali-hash followup) |
 | `IKeystoreService.deleteKey` | ✅ existing, drops cache + grants (`21b2e4a` extension) |
 | `IKeystoreService.updateSubcomponent` | ✅ updates leaf+chain in-place, evicts stale `patchedChains` (`21b2e4a`) |
 | `IKeystoreService.grant` / `ungrant` | ✅ synthetic `softwareGrants` table (`21b2e4a`) |
@@ -368,6 +368,65 @@ serve the owner's response no matter who is calling.
 `shouldSkipUid` 过滤器必须放在不变性查询**之后**，不能放在之前。否则 isolated
 process / 系统服务 / 任何不在 target.txt 配置里的 UID 都会走真实路径，把同一表面
 撕成两个不一致的视图。
+
+### 1b. Ultrasonic Fingerprint cali hash regression (2026-05-26) — fixed follow-up to de693c0
+
+The de693c0 fix moved the GRANT resolver ahead of `shouldSkipUid` so
+isolated-app readbacks resolve from `softwareGrants`. That is structurally
+correct for the duck-detector probe but introduced a cross-UID divergence:
+**every** caller — including vendor TAs and the engineering-mode probe —
+now hits the resolver, and the resolver only checked `softwareGrants[grantId]`,
+not the recorded grantee UID.
+
+Combined with `softwareGrantIdGen` seeded at `1L`, our synthetic grantIds lived
+in the dense low-bit range where real hardware/vendor grant IDs are also
+likely to land. When the fingerprint engineering-mode probe called
+`getKeyEntry(Domain.GRANT, realGrantId)` for a vendor-issued grant whose ID
+happened to collide with one of ours, we served the owner's cached
+`KeyEntryResponse` instead of forwarding to real keystore2. Symptom on device:
+工程模式 → 器件校准状态 → `[4]Ultrasonic.Fingerprint` showed
+`[4001] Ultrasonic Fingerprint cali hash get failed` (red ×). Disabling
+TEESimulator-RS restored the calibration readback.
+
+**Fix (two structural pieces, no pattern-specific evasion)**:
+
+1. `KeyMintSecurityLevelInterceptor.resolveGrantedResponse(grantId, callingUid)`
+   now takes the caller UID and only resolves when the recorded
+   `grant.granteeUid == callingUid`. Foreign callers (any UID we never issued
+   a grant to) fall through to real keystore2 unchanged. Both call sites in
+   `Keystore2Interceptor` (the upfront resolver and the post-skip fallback)
+   were updated.
+2. `softwareGrantIdGen` is now seeded with `SecureRandom` in the upper half
+   of the positive 63-bit range
+   (`(rand & 0x3fff_ffff_ffff_ffffL) | 0x4000_0000_0000_0000L`). The
+   grantee-UID guard is the authoritative defense; this seeding is a
+   probabilistic backup so the next regression of this shape gets a ~1/2^62
+   collision floor instead of dense overlap.
+
+**Lesson — single-source-of-truth invariants are bidirectional.** The 21b2e4a
+unification said "every reader of the GRANT plane sees the same owner
+response". The de693c0 fix made that hold for every UID. But the invariant
+implicitly assumes "the reader is one of our grantees" — without that bound,
+serving the owner response to a *foreign* caller breaks an even more important
+invariant: **we never modify replies for callers we don't own**. Yesterday's
+fix removed the wrong filter (`shouldSkipUid`); the right filter was always
+"is the caller the recorded grantee", which is a property of the grant entry
+itself, not of `target.txt`.
+
+**经验**：单一真值源的不变性是**双向**的。21b2e4a 让"GRANT 平面的每个读者看到
+相同的 owner 响应"，de693c0 让该不变性对每个 UID 都成立。但这个不变性隐含
+"读者是我们的 grantee"——少了这条约束，把 owner 响应丢给一个陌生调用者就破坏
+了一条更重要的不变性：**永不修改我们不拥有的调用者的响应**。昨天的修复去掉
+了错误的过滤器（`shouldSkipUid`），正确的过滤器一直是"调用者是否就是登记的
+grantee"，这是 grant 表项自带的属性，不是 `target.txt` 的属性。
+
+The C++-side filter (`filtered_codes` in `binder_interceptor.cpp:248-254`)
+only narrows by transaction code, not UID — so any defense that needs UID
+scoping must add it explicitly in the Kotlin handler. There is no second
+chance to add it later.
+
+C++ 侧的 `filtered_codes` 只按 transaction code 过滤，不按 UID — 任何需要按
+UID 限定的防御必须在 Kotlin handler 里显式加上，没有后置防线。
 
 ### 2. Hardcoded keybox serial revocation — not fixable in code
 
