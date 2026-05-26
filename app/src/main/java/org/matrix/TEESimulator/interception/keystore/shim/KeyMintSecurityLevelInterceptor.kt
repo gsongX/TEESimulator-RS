@@ -260,17 +260,6 @@ class KeyMintSecurityLevelInterceptor(
             val certNotBefore = keyParams?.find { it.tag == Tag.CERTIFICATE_NOT_BEFORE }?.value?.dateTime?.let { Date(it) }
             val certNotAfter = keyParams?.find { it.tag == Tag.CERTIFICATE_NOT_AFTER }?.value?.dateTime?.let { Date(it) }
 
-            // Skip-uid pass-through path: we let the post-handler run for
-            // these callers (Duck-Detector and similar non-target probes)
-            // only to neutralize the modificationTimeMs fingerprint —
-            // we do NOT patch the certificate chain or authorizations
-            // because we are not their owner. The reply is otherwise the
-            // unmodified real-keystore2 reply.
-            if (ConfigurationManager.shouldSkipUid(callingUid)) {
-                metadata.modificationTimeMs = SOFTWARE_KEY_MODIFICATION_TIME_MS
-                return InterceptorUtils.createTypedObjectReply(metadata)
-            }
-
             val newChain = AttestationPatcher.patchCertificateChain(originalChain, callingUid, certNotBefore, certNotAfter)
 
             val key = metadata.key
@@ -522,31 +511,24 @@ class KeyMintSecurityLevelInterceptor(
 
                 if (ConfigurationManager.shouldSkipUid(callingUid)
                     && attestationKey == null && !isAttestKeyRequest) {
-                    // Probes living outside our target list (e.g. Duck-Detector
-                    // itself running as a regular user app) also generate
-                    // attested EC P-256 keys to scrape the reply parcel. We
-                    // don't want to patch their certificate chain — we are not
-                    // their owner — but we DO need to neutralize byte-level
-                    // fingerprints in the metadata that we can flip without
-                    // changing the cryptographic story:
+                    // Skip-uid callers — apps that are NOT in target.txt —
+                    // are forwarded to real keystore2 unchanged. We learned
+                    // the hard way (this commit) that re-serialising their
+                    // generateKey reply via post-handler, even with no chain
+                    // patching and just a `metadata.modificationTimeMs = 1L`
+                    // tweak, breaks vendor flows that depend on byte-exact
+                    // reply parcels (e.g. ultrasonic fingerprint engineering
+                    // mode `cali hash get`). The `Continue` route forced
+                    // every attested-key generateKey to flow through our
+                    // post-handler regardless of UID, which silently
+                    // re-serialised every reply.
                     //
-                    //   * `modificationTimeMs` — heuristic walkers in
-                    //     Keystore2GenerateModeParcelFingerprintProbe match on
-                    //     `modTime > 4_999_999_999L` (≈ 58 days post-epoch),
-                    //     while KeyMetadataShapeProbe only checks
-                    //     `modTime > 0L`. A small positive value
-                    //     (NEUTRAL_MODIFICATION_TIME_MS = 1L) sits in the
-                    //     intersection and breaks the threshold rule on every
-                    //     reply we touch, regardless of caller UID.
-                    //
-                    // For requests that don't request attestation we still
-                    // ContinueAndSkipPost — there's no chain to fingerprint
-                    // and the fingerprint probe always asks for attestation.
-                    return if (parsedParams.attestationChallenge != null) {
-                        TransactionResult.Continue
-                    } else {
-                        TransactionResult.ContinueAndSkipPost
-                    }
+                    // Defeating Duck-Detector's
+                    // Keystore2GenerateModeParcelFingerprintProbe will need
+                    // a different lever — see the diagnostic dump
+                    // (`[TeeSimGenModeBytes]`) installed in the post-handler
+                    // chain-patch branch and the next iteration's plan.
+                    return TransactionResult.ContinueAndSkipPost
                 }
 
                 SystemLogger.trace { "[TRACE-$txId] generateKey alias=${keyDescriptor.alias} algo=${parsedParams.algorithm} challenge=${parsedParams.attestationChallenge?.size ?: "null"} serial=${parsedParams.serial != null} imei=${parsedParams.imei != null} noAuth=${parsedParams.noAuthRequired} purposes=${parsedParams.purpose}" }
