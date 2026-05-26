@@ -287,37 +287,7 @@ class KeyMintSecurityLevelInterceptor(
                 "Cached patched certificate chain for $keyId. (${key.alias} [${key.domain}, ${key.nspace}])"
             )
 
-            // Diagnostic dump for Keystore2GenerateModeParcelFingerprintProbe
-            // analysis. Marshal the metadata into a fresh parcel exactly the
-            // way createTypedObjectReply will, then log a hex window of the
-            // bytes the probe walker reads. Walker constants:
-            //   AUTHORIZATION_COUNT_OFFSET = 44
-            //   AUTHORIZATION_LOGICAL_START_OFFSET = 48
-            // Walker reads `authorizationCount` at offset 44 (one int) and
-            // walks 12-byte headers + payload. Empirically the walker reads
-            // its 8-byte `modificationTimeMs` somewhere in the auth array
-            // because of cumulative misalignment; we log the first 768 bytes
-            // so the actual misalignment landing zone is visible in logcat.
-            //
-            // Always-on (not gated by isDebugBuild) so production scans can
-            // be diagnosed via `adb logcat | grep TeeSimGenModeBytes`.
-            runCatching {
-                val parcel = android.os.Parcel.obtain()
-                try {
-                    parcel.writeNoException()
-                    parcel.writeTypedObject(metadata, 0)
-                    val bytes = parcel.marshall()
-                    val window = bytes.copyOfRange(0, minOf(bytes.size, 768))
-                    val hex = window.joinToString("") { "%02x".format(it.toInt() and 0xff) }
-                    SystemLogger.info(
-                        "[TeeSimGenModeBytes] uid=$callingUid len=${bytes.size} hex=$hex"
-                    )
-                } finally {
-                    parcel.recycle()
-                }
-            }.onFailure { SystemLogger.warning("Failed to dump generate-mode reply bytes: ${it.message}") }
-
-            return InterceptorUtils.createTypedObjectReply(metadata)
+            return InterceptorUtils.createTypedObjectReply(metadata, diagnosticTag = "gen-mode-patched")
         }
         return TransactionResult.SkipTransaction
     }

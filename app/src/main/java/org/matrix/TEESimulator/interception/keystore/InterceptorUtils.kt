@@ -123,13 +123,31 @@ object InterceptorUtils {
                 writeNoException()
                 writeTypedObject(obj, flags)
             }
-        if (diagnosticTag != null && SystemLogger.isDebugBuild) {
+        if (diagnosticTag != null) {
+            // Always-on hex dump for parcel-fingerprint diagnostics. The
+            // probe-relevant generateKey reply is emitted from
+            // `doSoftwareKeyGen` via createTypedObjectReply(diagnosticTag =
+            // "gen-mode-asym"); on devices where TEE attestation is broken
+            // (OnePlus BL-unlocked etc.), `isTeeFunctional = false` flips
+            // AUTO mode to GENERATE, so the post-handler GENERATE_KEY_TRANSACTION
+            // branch never runs and instrumentation there is unreachable.
+            // Logging here covers every reply path uniformly.
+            //
+            // tag prefix: `[GenModeBytes]`. Filter:
+            //   adb logcat -d *:S TEESimulator:I | grep GenModeBytes
             val savedPos = parcel.dataPosition()
             val wire = parcel.marshall()
             parcel.setDataPosition(savedPos)
-            val path = "/data/local/tmp/teesim-$diagnosticTag-${System.nanoTime()}.bin"
-            runCatching { java.io.File(path).writeBytes(wire) }
-            SystemLogger.debug("[$diagnosticTag] reply len=${wire.size} path=$path")
+            val window = wire.copyOfRange(0, minOf(wire.size, 768))
+            val hex = window.joinToString("") { "%02x".format(it.toInt() and 0xff) }
+            SystemLogger.info(
+                "[GenModeBytes] tag=$diagnosticTag len=${wire.size} hex=$hex"
+            )
+            if (SystemLogger.isDebugBuild) {
+                val path = "/data/local/tmp/teesim-$diagnosticTag-${System.nanoTime()}.bin"
+                runCatching { java.io.File(path).writeBytes(wire) }
+                SystemLogger.debug("[$diagnosticTag] reply len=${wire.size} path=$path")
+            }
         }
         return BinderInterceptor.TransactionResult.OverrideReply(parcel)
     }
