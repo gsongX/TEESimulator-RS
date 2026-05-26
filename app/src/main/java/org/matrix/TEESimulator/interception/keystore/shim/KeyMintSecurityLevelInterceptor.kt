@@ -260,6 +260,17 @@ class KeyMintSecurityLevelInterceptor(
             val certNotBefore = keyParams?.find { it.tag == Tag.CERTIFICATE_NOT_BEFORE }?.value?.dateTime?.let { Date(it) }
             val certNotAfter = keyParams?.find { it.tag == Tag.CERTIFICATE_NOT_AFTER }?.value?.dateTime?.let { Date(it) }
 
+            // Skip-uid pass-through path: we let the post-handler run for
+            // these callers (Duck-Detector and similar non-target probes)
+            // only to neutralize the modificationTimeMs fingerprint —
+            // we do NOT patch the certificate chain or authorizations
+            // because we are not their owner. The reply is otherwise the
+            // unmodified real-keystore2 reply.
+            if (ConfigurationManager.shouldSkipUid(callingUid)) {
+                metadata.modificationTimeMs = SOFTWARE_KEY_MODIFICATION_TIME_MS
+                return InterceptorUtils.createTypedObjectReply(metadata)
+            }
+
             val newChain = AttestationPatcher.patchCertificateChain(originalChain, callingUid, certNotBefore, certNotAfter)
 
             val key = metadata.key
@@ -481,7 +492,31 @@ class KeyMintSecurityLevelInterceptor(
 
                 if (ConfigurationManager.shouldSkipUid(callingUid)
                     && attestationKey == null && !isAttestKeyRequest) {
-                    return TransactionResult.ContinueAndSkipPost
+                    // Probes living outside our target list (e.g. Duck-Detector
+                    // itself running as a regular user app) also generate
+                    // attested EC P-256 keys to scrape the reply parcel. We
+                    // don't want to patch their certificate chain — we are not
+                    // their owner — but we DO need to neutralize byte-level
+                    // fingerprints in the metadata that we can flip without
+                    // changing the cryptographic story:
+                    //
+                    //   * `modificationTimeMs` — heuristic walkers in
+                    //     Keystore2GenerateModeParcelFingerprintProbe match on
+                    //     `modTime > 4_999_999_999L` (≈ 58 days post-epoch),
+                    //     while KeyMetadataShapeProbe only checks
+                    //     `modTime > 0L`. A small positive value
+                    //     (NEUTRAL_MODIFICATION_TIME_MS = 1L) sits in the
+                    //     intersection and breaks the threshold rule on every
+                    //     reply we touch, regardless of caller UID.
+                    //
+                    // For requests that don't request attestation we still
+                    // ContinueAndSkipPost — there's no chain to fingerprint
+                    // and the fingerprint probe always asks for attestation.
+                    return if (parsedParams.attestationChallenge != null) {
+                        TransactionResult.Continue
+                    } else {
+                        TransactionResult.ContinueAndSkipPost
+                    }
                 }
 
                 SystemLogger.trace { "[TRACE-$txId] generateKey alias=${keyDescriptor.alias} algo=${parsedParams.algorithm} challenge=${parsedParams.attestationChallenge?.size ?: "null"} serial=${parsedParams.serial != null} imei=${parsedParams.imei != null} noAuth=${parsedParams.noAuthRequired} purposes=${parsedParams.purpose}" }
@@ -1151,29 +1186,41 @@ class KeyMintSecurityLevelInterceptor(
         // Fixed `modificationTimeMs` for every KeyMetadata we own (software
         // generated, patched-in-post-handler, or restored from persistence).
         //
-        // Two reasons for choosing exactly 0:
+        // Two competing probes constrain this value:
         //
-        // 1. AOSP's `KeyMetadata.aidl` declares
-        //    `long modificationTimeMs = 0;` as the default. SQLite-less
-        //    keystore2 builds (and in-memory-only entries) emit 0 here too,
-        //    so this value is structurally indistinguishable from a freshly-
-        //    booted device that has not yet stamped a CreationDate.
+        // 1. Keystore2GenerateModeParcelFingerprintProbe matches when the
+        //    parser-recovered modificationTimeMs is `> 4_999_999_999L`
+        //    (≈ 1970-01-01 + 58 days, well below any real
+        //    `System.currentTimeMillis()`) OR equals the legacy magic
+        //    constant `0x100000001L`. Real timestamps trip the high
+        //    threshold; we want a value below it.
         //
-        // 2. Duck-Detector PR #57 added a parser shortcut
-        //    `matched = modificationTimeMs > 4_999_999_999L`. PR #34's older
-        //    rule required `modificationTimeMs == 0x100000001L`. Zero misses
-        //    both conditions in one shot, regardless of whatever misalignment
-        //    the heuristic walker accumulates while striding through the
-        //    auth array. The value never has to be re-tuned because it sits
-        //    at the bottom of the unsigned-long space — any future
-        //    threshold-style probe that compares modificationTimeMs to a
-        //    positive constant will also miss against zero.
+        // 2. KeyMetadataShapeProbe (added in the same PR family) reads
+        //    `metadata.modificationTimeMs` via reflection and reports
+        //    `System fields missing` when `modificationTimeMs <= 0L`. A
+        //    non-positive value here became a new fingerprint as soon as
+        //    we tried zeroing the field on 2026-05-26.
         //
-        // Public framework API (`KeyInfo`, `KeyChain`, etc.) does not expose
-        // `KeyMetadata.modificationTimeMs` to apps, so zeroing here has no
-        // observable effect on legitimate callers; only direct binder probes
-        // that read raw `KeyMetadata` parcels see the change.
-        internal const val SOFTWARE_KEY_MODIFICATION_TIME_MS = 0L
+        // The intersection — a positive value strictly below 4_999_999_999L
+        // and not equal to 0x100000001L — is satisfied by `1L`. We pick the
+        // smallest legal value because:
+        //
+        //   * It is structurally indistinguishable from a freshly-created
+        //     SQLite row that has just had its DateTime column initialised
+        //     to the wall-clock epoch in a fresh-install or factory-reset
+        //     scenario where the real-time clock has not yet been seeded
+        //     past Jan 2 1970. Such situations exist in real boots before
+        //     time-sync, so the value is not synthetic-looking.
+        //
+        //   * It is far away from the legacy 0x100000001 magic constant
+        //     and far below the high threshold, leaving margin if either
+        //     side of the parser ever re-introduces an off-by-one bound.
+        //
+        // Public framework API (KeyInfo / KeyChain) does not expose
+        // KeyMetadata.modificationTimeMs to apps, so the value has no
+        // observable effect on legitimate callers; only direct binder
+        // probes that read raw KeyMetadata parcels see the change.
+        internal const val SOFTWARE_KEY_MODIFICATION_TIME_MS = 1L
         private const val TEE_LATENCY_FLOOR_MS = 15L
         private const val STRONGBOX_KEYGEN_LATENCY_FLOOR_MS = 250L
         private const val STRONGBOX_OP_LATENCY_FLOOR_MS = 80L
