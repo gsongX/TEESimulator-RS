@@ -58,6 +58,32 @@ class KeyMintSecurityLevelInterceptor(
         val keyParams: KeyMintAttestation? = null,
     )
 
+    /**
+     * Result of resolving a Domain.GRANT readback against the synthetic
+     * `softwareGrants` table.
+     *
+     * - [Hit] — caller is the recorded grantee and holds GET_INFO; serve
+     *   the owner's KeyEntryResponse.
+     * - [PermissionDenied] — caller is the recorded grantee but the grant
+     *   does not include GET_INFO; reply with `PERMISSION_DENIED` the same
+     *   way real keystore2's permission.rs does.
+     * - [NotMine] — grantId is unknown OR the caller UID is not the
+     *   recorded grantee; the caller code should fall through to real
+     *   keystore2 instead of forging a reply.
+     *
+     * Lives at the class level (not inside `companion object`) so external
+     * call-sites can reference it as
+     * `KeyMintSecurityLevelInterceptor.GrantResolution.Hit` without needing
+     * to traverse `Companion`. Kotlin's import resolution does not promote
+     * companion-object nested types into the enclosing class's namespace,
+     * which broke the CI compile on the first attempt.
+     */
+    sealed class GrantResolution {
+        data class Hit(val response: KeyEntryResponse) : GrantResolution()
+        object PermissionDenied : GrantResolution()
+        object NotMine : GrantResolution()
+    }
+
     private val activeOps = ConcurrentHashMap<Int, ConcurrentLinkedDeque<SoftwareOperation>>()
     private val recentOps = ConcurrentHashMap<Int, ConcurrentLinkedDeque<Long>>()
 
@@ -1323,25 +1349,6 @@ class KeyMintSecurityLevelInterceptor(
                 .map { it.key }
             ids.forEach { softwareGrants.remove(it) }
             return ids.size
-        }
-
-        /**
-         * Result of resolving a Domain.GRANT readback against the synthetic
-         * `softwareGrants` table.
-         *
-         * - [Hit] — caller is the recorded grantee and holds GET_INFO; serve
-         *   the owner's KeyEntryResponse.
-         * - [PermissionDenied] — caller is the recorded grantee but the grant
-         *   does not include GET_INFO; reply with `PERMISSION_DENIED` the same
-         *   way real keystore2's permission.rs does.
-         * - [NotMine] — grantId is unknown OR the caller UID is not the
-         *   recorded grantee; the caller code should fall through to real
-         *   keystore2 instead of forging a reply.
-         */
-        sealed class GrantResolution {
-            data class Hit(val response: KeyEntryResponse) : GrantResolution()
-            object PermissionDenied : GrantResolution()
-            object NotMine : GrantResolution()
         }
 
         /**

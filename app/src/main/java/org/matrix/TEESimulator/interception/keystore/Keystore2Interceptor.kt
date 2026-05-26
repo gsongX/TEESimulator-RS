@@ -17,6 +17,7 @@ import org.matrix.TEESimulator.attestation.KeyMintAttestation
 import org.matrix.TEESimulator.config.ConfigurationManager
 import org.matrix.TEESimulator.interception.keystore.shim.GeneratedKeyPersistence
 import org.matrix.TEESimulator.interception.keystore.shim.KeyMintSecurityLevelInterceptor
+import org.matrix.TEESimulator.interception.keystore.shim.KeyMintSecurityLevelInterceptor.GrantResolution
 import org.matrix.TEESimulator.logging.KeyMintParameterLogger
 import org.matrix.TEESimulator.logging.SystemLogger
 import org.matrix.TEESimulator.pki.CertificateGenerator
@@ -268,14 +269,14 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                         val resolution = KeyMintSecurityLevelInterceptor
                             .resolveGrant(prefetchedDescriptor.nspace, callingUid)
                         when (resolution) {
-                            is KeyMintSecurityLevelInterceptor.GrantResolution.Hit -> {
+                            is GrantResolution.Hit -> {
                                 SystemLogger.info(
                                     "[TX_ID: $txId] Found generated response via GRANT grantId=" +
                                         "(uid=$callingUid pre-skip)"
                                 )
                                 return InterceptorUtils.createTypedObjectReply(resolution.response)
                             }
-                            KeyMintSecurityLevelInterceptor.GrantResolution.PermissionDenied -> {
+                            GrantResolution.PermissionDenied -> {
                                 // The grant exists but its accessVector lacks
                                 // GET_INFO. Real keystore2 returns
                                 // PERMISSION_DENIED here; mirror that exactly
@@ -288,7 +289,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                                 )
                                 return InterceptorUtils.createErrorReply(RESPONSE_PERMISSION_DENIED)
                             }
-                            KeyMintSecurityLevelInterceptor.GrantResolution.NotMine -> {
+                            GrantResolution.NotMine -> {
                                 // Foreign GRANT — fall through. Post-skip
                                 // GRANT branch below is harmless because the
                                 // resolver will return NotMine again for the
@@ -385,19 +386,19 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                     val resolution = KeyMintSecurityLevelInterceptor
                         .resolveGrant(descriptor.nspace, callingUid)
                     when (resolution) {
-                        is KeyMintSecurityLevelInterceptor.GrantResolution.Hit -> {
+                        is GrantResolution.Hit -> {
                             SystemLogger.info(
                                 "[TX_ID: $txId] Found generated response via GRANT grantId=${descriptor.nspace} (post-skip fallback)"
                             )
                             return InterceptorUtils.createTypedObjectReply(resolution.response)
                         }
-                        KeyMintSecurityLevelInterceptor.GrantResolution.PermissionDenied -> {
+                        GrantResolution.PermissionDenied -> {
                             SystemLogger.info(
                                 "[TX_ID: $txId] GRANT readback denied (accessVector lacks GET_INFO) for grantId=${descriptor.nspace} uid=$callingUid (post-skip fallback)"
                             )
                             return InterceptorUtils.createErrorReply(RESPONSE_PERMISSION_DENIED)
                         }
-                        KeyMintSecurityLevelInterceptor.GrantResolution.NotMine -> Unit
+                        GrantResolution.NotMine -> Unit
                     }
                 }
                 return TransactionResult.ContinueAndSkipPost
