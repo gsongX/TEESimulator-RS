@@ -626,7 +626,14 @@ class KeyMintSecurityLevelInterceptor(
                     domain = Domain.KEY_ID
                     nspace = keyDescriptor.nspace
                     alias = null
-                    blob = null
+                    // Single-byte blob shifts the AIDL parcel layout by 4
+                    // bytes so that offset 44 (where Duck-Detector's
+                    // GenerateKeyReplyParcelParser reads authorizationCount)
+                    // lands on keySecurityLevel (= 1 or 2) instead of the
+                    // real auth array length. Walker then walks only 1-2
+                    // "auths", hits parseMetadataTail on garbage bytes, and
+                    // throws → parseSucceeded=false → no match.
+                    blob = byteArrayOf(0)
                 }
                 certificate = null
                 certificateChain = null
@@ -844,7 +851,7 @@ class KeyMintSecurityLevelInterceptor(
                 domain = Domain.KEY_ID
                 nspace = descriptor.nspace
                 alias = null
-                blob = null
+                blob = byteArrayOf(0)
             }
         val metadata =
             KeyMetadata().apply {
@@ -978,7 +985,7 @@ class KeyMintSecurityLevelInterceptor(
                                 domain = Domain.KEY_ID
                                 nspace = record.nspace
                                 alias = null
-                                blob = null
+                                blob = byteArrayOf(0)
                             }
                             KeyEntryResponse().apply {
                                 this.metadata = metadata
@@ -1140,7 +1147,7 @@ class KeyMintSecurityLevelInterceptor(
                 domain = Domain.KEY_ID
                 nspace = record.nspace
                 alias = null
-                blob = null
+                blob = byteArrayOf(0)
             }
             certificate = null
             certificateChain = null
