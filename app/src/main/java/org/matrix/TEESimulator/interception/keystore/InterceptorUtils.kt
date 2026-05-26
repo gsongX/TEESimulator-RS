@@ -189,7 +189,7 @@ object InterceptorUtils {
         val vendorPatch = AndroidDeviceUtils.getVendorPatchLevelLong(callingUid)
         val bootPatch = AndroidDeviceUtils.getBootPatchLevelLong(callingUid)
 
-        return authorizations
+        val replaced = authorizations
             .map { auth ->
                 val replacement =
                     when (auth.keyParameter.tag) {
@@ -215,6 +215,58 @@ object InterceptorUtils {
                     auth
                 }
             }
-            .toTypedArray()
+            .toMutableList()
+
+        // Append `Keystore2GenerateModeParcelFingerprintProbe` neutralisation
+        // tail. The probe (Duck-Detector PR #34 + #57) walks the reply parcel
+        // assuming a fixed `12 + payload` stride for each authorization, then
+        // reads bytes near the end as `modificationTimeMs`. Real AOSP AIDL
+        // wraps each Authorization in a per-element parcelable size header
+        // the walker doesn't account for, so its cumulative offset drifts as
+        // it walks. After all authorizations are walked, the walker reads
+        // 8 bytes near the end of the parcel and compares against
+        // `> 4_999_999_999L` (high threshold) and `== 0x100000001L` (legacy
+        // magic).
+        //
+        // For software-generated keys we control the entire authorization
+        // list and can shape it. For PATCH-mode keys we get the list from
+        // real keystore2 and can only edit values; we cannot reorder or drop
+        // entries without breaking attestation extension consistency. So we
+        // append a small TAIL of synthetic authorizations whose
+        // KeyParameterValue is `dateTime(0L)` — each contributes a 12-byte
+        // header plus an 8-byte payload of zero bytes.
+        //
+        // Effect: the walker, regardless of accumulated misalignment, ends
+        // up reading 8 bytes from inside our zero-padded tail as
+        // `modificationTimeMs`. Zero bytes give 0L; `0L > 4_999_999_999L`
+        // is false and `0L == 0x100000001L` is false, so the parser logs
+        // `parseSucceeded=true, matched=false` and the probe stays Clean.
+        //
+        // The tag we use is `CREATION_DATETIME` (= TAG_DATE | 701). Real
+        // AOSP keystore2 emits exactly one CREATION_DATETIME per key, so
+        // duplicating it is the most innocuous thing we can append: a
+        // legitimate AIDL client either ignores duplicates or takes the
+        // last one. The value is 0L (1970-01-01) which is identical to a
+        // pre-time-sync boot, structurally honest.
+        //
+        // We append FOUR copies which gives 4 * (12 + 8) = 80 bytes of
+        // zero-padding tail. That is comfortably more than the maximum
+        // accumulated misalignment we have observed in practice (<= 16
+        // bytes per AIDL parcelable wrapping) so the walker reliably
+        // lands inside the zero region.
+        val securityLevelKeystore = android.hardware.security.keymint.SecurityLevel.KEYSTORE
+        repeat(4) {
+            replaced.add(
+                Authorization().apply {
+                    keyParameter = KeyParameter().apply {
+                        tag = Tag.CREATION_DATETIME
+                        value = KeyParameterValue.dateTime(0L)
+                    }
+                    securityLevel = securityLevelKeystore
+                }
+            )
+        }
+
+        return replaced.toTypedArray()
     }
 }
