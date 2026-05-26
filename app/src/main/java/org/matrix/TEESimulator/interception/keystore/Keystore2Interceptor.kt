@@ -72,6 +72,12 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
     }
 
     private const val RESPONSE_KEY_NOT_FOUND = 7
+    // ResponseCode::PERMISSION_DENIED — keystore2/src/permission.rs uses this
+    // numeric code (declared in IKeystoreService.aidl ResponseCode) for grant
+    // accessVector / SELinux denials. We emit it via the same SSE wrapper as
+    // KEY_NOT_FOUND so framework callers see the standard
+    // android.security.KeyStoreException(PERMISSION_DENIED).
+    private const val RESPONSE_PERMISSION_DENIED = 6
     private val deletedSoftwareKeys: MutableSet<KeyIdentifier> = ConcurrentHashMap.newKeySet()
     private val userUpdatedKeys = ConcurrentHashMap.newKeySet<KeyIdentifier>()
 
@@ -259,18 +265,36 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                     if (prefetchedDescriptor != null &&
                         prefetchedDescriptor.alias == null &&
                         prefetchedDescriptor.domain == Domain.GRANT) {
-                        val grantHit = KeyMintSecurityLevelInterceptor
-                            .resolveGrantedResponse(prefetchedDescriptor.nspace, callingUid)
-                        if (grantHit != null) {
-                            SystemLogger.info(
-                                "[TX_ID: $txId] Found generated response via GRANT grantId=" +
-                                    "(uid=$callingUid pre-skip)"
-                            )
-                            return InterceptorUtils.createTypedObjectReply(grantHit)
+                        val resolution = KeyMintSecurityLevelInterceptor
+                            .resolveGrant(prefetchedDescriptor.nspace, callingUid)
+                        when (resolution) {
+                            is KeyMintSecurityLevelInterceptor.GrantResolution.Hit -> {
+                                SystemLogger.info(
+                                    "[TX_ID: $txId] Found generated response via GRANT grantId=" +
+                                        "(uid=$callingUid pre-skip)"
+                                )
+                                return InterceptorUtils.createTypedObjectReply(resolution.response)
+                            }
+                            KeyMintSecurityLevelInterceptor.GrantResolution.PermissionDenied -> {
+                                // The grant exists but its accessVector lacks
+                                // GET_INFO. Real keystore2 returns
+                                // PERMISSION_DENIED here; mirror that exactly
+                                // so PR #57's access-vector probe sees the
+                                // same denial against software keys as it
+                                // would against hardware keys.
+                                SystemLogger.info(
+                                    "[TX_ID: $txId] GRANT readback denied (accessVector lacks GET_INFO) " +
+                                        "for grantId=${prefetchedDescriptor.nspace} uid=$callingUid"
+                                )
+                                return InterceptorUtils.createErrorReply(RESPONSE_PERMISSION_DENIED)
+                            }
+                            KeyMintSecurityLevelInterceptor.GrantResolution.NotMine -> {
+                                // Foreign GRANT — fall through. Post-skip
+                                // GRANT branch below is harmless because the
+                                // resolver will return NotMine again for the
+                                // same (grantId, uid) pair.
+                            }
                         }
-                        // Foreign GRANT (no synthetic table entry) — fall through.
-                        // The post-skip GRANT branch below is harmless because the
-                        // resolver will return null for the same (grantId,uid) pair.
                     }
                 }
             }
@@ -350,17 +374,30 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                         return InterceptorUtils.createTypedObjectReply(teeResp)
                     }
                 } else if (descriptor.domain == Domain.GRANT) {
-                    // Defense-in-depth: the upfront GRANT resolver right after the
-                    // GET_KEY_ENTRY_TRANSACTION dispatch already handles this case
-                    // for every UID (including isolated_app). We keep this branch
-                    // as a backup in case the upfront parcel rewind ever fails on
-                    // an exotic AOSP fork where data.setDataPosition is not
-                    // idempotent. Cheap and harmless to leave here.
-                    KeyMintSecurityLevelInterceptor.resolveGrantedResponse(descriptor.nspace, callingUid)?.let { resp ->
-                        SystemLogger.info(
-                            "[TX_ID: $txId] Found generated response via GRANT grantId=${descriptor.nspace} (post-skip fallback)"
-                        )
-                        return InterceptorUtils.createTypedObjectReply(resp)
+                    // Defense-in-depth: the upfront GRANT resolver right after
+                    // the GET_KEY_ENTRY_TRANSACTION dispatch already handles
+                    // every UID. We keep this branch as a backup in case the
+                    // upfront parcel rewind ever fails on an exotic AOSP fork
+                    // where data.setDataPosition is not idempotent. Mirrors
+                    // the upfront branch's tri-state (Hit / PermissionDenied /
+                    // NotMine) so the access-vector enforcement remains
+                    // consistent on any path.
+                    val resolution = KeyMintSecurityLevelInterceptor
+                        .resolveGrant(descriptor.nspace, callingUid)
+                    when (resolution) {
+                        is KeyMintSecurityLevelInterceptor.GrantResolution.Hit -> {
+                            SystemLogger.info(
+                                "[TX_ID: $txId] Found generated response via GRANT grantId=${descriptor.nspace} (post-skip fallback)"
+                            )
+                            return InterceptorUtils.createTypedObjectReply(resolution.response)
+                        }
+                        KeyMintSecurityLevelInterceptor.GrantResolution.PermissionDenied -> {
+                            SystemLogger.info(
+                                "[TX_ID: $txId] GRANT readback denied (accessVector lacks GET_INFO) for grantId=${descriptor.nspace} uid=$callingUid (post-skip fallback)"
+                            )
+                            return InterceptorUtils.createErrorReply(RESPONSE_PERMISSION_DENIED)
+                        }
+                        KeyMintSecurityLevelInterceptor.GrantResolution.NotMine -> Unit
                     }
                 }
                 return TransactionResult.ContinueAndSkipPost
@@ -505,6 +542,14 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                                 response.metadata.authorizations,
                                 callingUid,
                             )
+                        // Zero modificationTimeMs — see SOFTWARE_KEY_MODIFICATION_TIME_MS
+                        // comment in KeyMintSecurityLevelInterceptor. We just
+                        // rebuilt the chain and authorizations from scratch,
+                        // so the original real-keystore2 timestamp on this
+                        // metadata is no longer meaningful and otherwise
+                        // trips Duck-Detector PR #57's modTime threshold.
+                        response.metadata.modificationTimeMs =
+                            KeyMintSecurityLevelInterceptor.SOFTWARE_KEY_MODIFICATION_TIME_MS
                         return InterceptorUtils.createTypedObjectReply(response)
                     }
 
@@ -537,6 +582,11 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                                 response.metadata.authorizations,
                                 callingUid,
                             )
+                        // Zero modificationTimeMs (see comment above) — we
+                        // also rebuilt the chain and authorizations on this
+                        // attest-key path, so we own the metadata now.
+                        response.metadata.modificationTimeMs =
+                            KeyMintSecurityLevelInterceptor.SOFTWARE_KEY_MODIFICATION_TIME_MS
 
                         val newNspace = SecureRandom().nextLong()
                         response.metadata.key?.let { it.nspace = newNspace }
@@ -616,6 +666,12 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                             response.metadata.authorizations,
                             callingUid,
                         )
+                    // Zero modificationTimeMs (see comment above) — same
+                    // reasoning as the imported-retained-chain and attest-key
+                    // paths: we just rebuilt the chain and authorizations,
+                    // so any real-keystore2 timestamp would be stale anyway.
+                    response.metadata.modificationTimeMs =
+                        KeyMintSecurityLevelInterceptor.SOFTWARE_KEY_MODIFICATION_TIME_MS
 
                     return InterceptorUtils.createTypedObjectReply(response)
                 }
@@ -703,8 +759,13 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
             val descriptor = data.readTypedObject(KeyDescriptor.CREATOR)
                 ?: return@runCatching TransactionResult.ContinueAndSkipPost
             val granteeUid = data.readInt()
-            // accessVector is the third arg; we do not need it because software
-            // keys do not enforce per-grant permission masks here.
+            // accessVector is the third arg of grant(KeyDescriptor, int, int).
+            // Real keystore2 stores it on the keyentries grant row and enforces
+            // it in permission.rs:check_grant_permission. We must record it on
+            // the synthetic grant so resolveGrant can return PERMISSION_DENIED
+            // when the grantee tries to readback without GET_INFO — see Duck
+            // Detector PR #57's "Grant access vector" probe.
+            val accessVector = data.readInt()
 
             val ownerKeyId = resolveOwnerKeyId(callingUid, descriptor) ?: run {
                 SystemLogger.debug(
@@ -713,9 +774,13 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                 return@runCatching TransactionResult.ContinueAndSkipPost
             }
 
-            val grantId = KeyMintSecurityLevelInterceptor.issueSoftwareGrant(ownerKeyId, granteeUid)
+            val grantId = KeyMintSecurityLevelInterceptor.issueSoftwareGrant(
+                ownerKeyId = ownerKeyId,
+                granteeUid = granteeUid,
+                accessVector = accessVector,
+            )
             SystemLogger.info(
-                "[TX_ID: $txId] Issued software grant for $ownerKeyId -> uid=$granteeUid grantId=$grantId"
+                "[TX_ID: $txId] Issued software grant for $ownerKeyId -> uid=$granteeUid grantId=$grantId accessVector=0x${java.lang.Integer.toHexString(accessVector)}"
             )
 
             val granted = KeyDescriptor().apply {

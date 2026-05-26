@@ -148,6 +148,7 @@ class KeyMintSecurityLevelInterceptor(
                     CertificateHelper.updateCertificateChain(metadata, newChain).getOrThrow()
                     metadata.authorizations =
                         InterceptorUtils.patchAuthorizations(metadata.authorizations, callingUid)
+                    metadata.modificationTimeMs = SOFTWARE_KEY_MODIFICATION_TIME_MS
                     patchedChains[keyId] = newChain
                     teeResponses[keyId] = KeyEntryResponse().apply {
                         this.metadata = metadata
@@ -216,6 +217,11 @@ class KeyMintSecurityLevelInterceptor(
                 // the forwarded non-attested path takes ~1.5ms, and
                 // TimingSideChannelProbe flags the 1.55x ratio.
                 cleanupKeyData(keyId)
+                // The cached copy may be re-emitted later via KEY_ID
+                // getKeyEntry, so zero modificationTimeMs the same way the
+                // patched-chain path does. The real-keystore2 reply that
+                // passes through to the caller in this branch is unchanged.
+                metadata.modificationTimeMs = SOFTWARE_KEY_MODIFICATION_TIME_MS
                 teeResponses[keyId] = KeyEntryResponse().apply {
                     this.metadata = metadata
                     iSecurityLevel = original
@@ -235,6 +241,15 @@ class KeyMintSecurityLevelInterceptor(
             CertificateHelper.updateCertificateChain(metadata, newChain).getOrThrow()
             metadata.authorizations =
                 InterceptorUtils.patchAuthorizations(metadata.authorizations, callingUid)
+            // Zero modificationTimeMs on every metadata we patch — see the
+            // SOFTWARE_KEY_MODIFICATION_TIME_MS comment in this file. Real
+            // keystore2 stamps the field with currentTimeMillis() before our
+            // post-transact hook runs, which trips Duck-Detector PR #57's
+            // `modificationTimeMs > 4_999_999_999L` shortcut. We always
+            // regenerate the chain and authorizations for these replies, so
+            // owning modificationTimeMs is consistent with the rest of our
+            // ownership semantics here.
+            metadata.modificationTimeMs = SOFTWARE_KEY_MODIFICATION_TIME_MS
 
             cleanupKeyData(keyId)
             patchedChains[keyId] = newChain
@@ -573,7 +588,7 @@ class KeyMintSecurityLevelInterceptor(
                 certificate = null
                 certificateChain = null
                 authorizations = parsedParams.toAuthorizations(callingUid, securityLevel)
-                modificationTimeMs = System.currentTimeMillis()
+                modificationTimeMs = SOFTWARE_KEY_MODIFICATION_TIME_MS
             }
             val response = KeyEntryResponse().apply {
                 this.metadata = metadata
@@ -794,7 +809,7 @@ class KeyMintSecurityLevelInterceptor(
                 key = normalizedKeyDescriptor
                 CertificateHelper.updateCertificateChain(this, chain.toTypedArray()).getOrThrow()
                 authorizations = params.toAuthorizations(callingUid, securityLevel)
-                modificationTimeMs = System.currentTimeMillis()
+                modificationTimeMs = SOFTWARE_KEY_MODIFICATION_TIME_MS
             }
         return KeyEntryResponse().apply {
             this.metadata = metadata
@@ -1087,7 +1102,7 @@ class KeyMintSecurityLevelInterceptor(
             certificate = null
             certificateChain = null
             authorizations = attestation.toAuthorizations(record.uid, securityLevel)
-            modificationTimeMs = System.currentTimeMillis()
+            modificationTimeMs = SOFTWARE_KEY_MODIFICATION_TIME_MS
         }
         return KeyEntryResponse().apply {
             this.metadata = metadata
@@ -1106,6 +1121,33 @@ class KeyMintSecurityLevelInterceptor(
         private const val RESPONSE_INVALID_ARGUMENT = 20
         private const val RESPONSE_PERMISSION_DENIED = 6
         private const val RESPONSE_KEY_NOT_FOUND = 7
+
+        // Fixed `modificationTimeMs` for every KeyMetadata we own (software
+        // generated, patched-in-post-handler, or restored from persistence).
+        //
+        // Two reasons for choosing exactly 0:
+        //
+        // 1. AOSP's `KeyMetadata.aidl` declares
+        //    `long modificationTimeMs = 0;` as the default. SQLite-less
+        //    keystore2 builds (and in-memory-only entries) emit 0 here too,
+        //    so this value is structurally indistinguishable from a freshly-
+        //    booted device that has not yet stamped a CreationDate.
+        //
+        // 2. Duck-Detector PR #57 added a parser shortcut
+        //    `matched = modificationTimeMs > 4_999_999_999L`. PR #34's older
+        //    rule required `modificationTimeMs == 0x100000001L`. Zero misses
+        //    both conditions in one shot, regardless of whatever misalignment
+        //    the heuristic walker accumulates while striding through the
+        //    auth array. The value never has to be re-tuned because it sits
+        //    at the bottom of the unsigned-long space — any future
+        //    threshold-style probe that compares modificationTimeMs to a
+        //    positive constant will also miss against zero.
+        //
+        // Public framework API (`KeyInfo`, `KeyChain`, etc.) does not expose
+        // `KeyMetadata.modificationTimeMs` to apps, so zeroing here has no
+        // observable effect on legitimate callers; only direct binder probes
+        // that read raw `KeyMetadata` parcels see the change.
+        internal const val SOFTWARE_KEY_MODIFICATION_TIME_MS = 0L
         private const val TEE_LATENCY_FLOOR_MS = 15L
         private const val STRONGBOX_KEYGEN_LATENCY_FLOOR_MS = 250L
         private const val STRONGBOX_OP_LATENCY_FLOOR_MS = 80L
@@ -1176,7 +1218,28 @@ class KeyMintSecurityLevelInterceptor(
             (secureRandom.nextLong() and 0x3fff_ffff_ffff_ffffL) or 0x4000_0000_0000_0000L
         )
 
-        data class SoftwareGrant(val ownerKeyId: KeyIdentifier, val granteeUid: Int)
+        // accessVector mirrors keystore2's KeyPermission bitfield. Real
+        // keystore2 enforces these bits in service.rs:`check_grant_permission`
+        // before serving getKeyEntry(Domain.GRANT, grantId): a grantee that
+        // holds only USE (0x100) gets PERMISSION_DENIED on getKeyEntry/getInfo
+        // because GET_INFO (0x4) is not in the vector. Duck-Detector
+        // PR #57's "Grant access vector" probe (2026-05-26) issues a
+        // USE-only grant and treats a successful grantee getKeyEntry as
+        // GET_KEY_ENTRY_WITHOUT_GET_INFO_ALLOWED (FAIL). We must apply the
+        // same enforcement here so the GRANT plane behaves like real
+        // keystore2 even for software-generated owner aliases.
+        data class SoftwareGrant(
+            val ownerKeyId: KeyIdentifier,
+            val granteeUid: Int,
+            val accessVector: Int,
+        )
+
+        // KeyPermission bits — matches AOSP system/security/keystore2/src/permission.rs:
+        //   GET_INFO  = 0x004 → required for getKeyEntry / getKeyCharacteristics
+        //   USE       = 0x100 → required for createOperation
+        // We only need to enforce GET_INFO here because getKeyEntry is the
+        // single transaction the GRANT plane resolver serves.
+        private const val KEY_PERMISSION_GET_INFO = 0x4
 
         fun getGeneratedKeyResponse(keyId: KeyIdentifier): KeyEntryResponse? =
             generatedKeys[keyId]?.response ?: teeResponses[keyId]
@@ -1216,19 +1279,31 @@ class KeyMintSecurityLevelInterceptor(
         /**
          * Issues a synthetic grantId mapped to a software-generated owner key.
          * The grantId is stable for the lifetime of the owner key, so repeated
-         * grant() calls for the same (owner, grantee) pair return the same id —
-         * mirroring AOSP keystore2 behavior closely enough that probes cannot
-         * fingerprint us by reissue patterns.
+         * grant() calls for the same (owner, grantee, accessVector) tuple
+         * return the same id — mirroring AOSP keystore2 idempotence on repeat
+         * grants. accessVector is recorded so resolveGrantedResponse can
+         * enforce KeyPermission::GET_INFO the way real keystore2 does in
+         * permission.rs:check_grant_permission.
          */
-        fun issueSoftwareGrant(ownerKeyId: KeyIdentifier, granteeUid: Int): Long {
-            // Reuse an existing grantId for the same pair to avoid leaking the
-            // id space and to match AOSP keystore2 idempotence on repeat grants.
+        fun issueSoftwareGrant(
+            ownerKeyId: KeyIdentifier,
+            granteeUid: Int,
+            accessVector: Int,
+        ): Long {
+            // Reuse an existing grantId for the same triple to avoid leaking
+            // the id space. We key on accessVector too because real keystore2
+            // stores it in the keyentries grant row, so re-granting with a
+            // different vector is a different identity.
             softwareGrants.entries
-                .firstOrNull { (_, grant) -> grant.ownerKeyId == ownerKeyId && grant.granteeUid == granteeUid }
+                .firstOrNull { (_, grant) ->
+                    grant.ownerKeyId == ownerKeyId &&
+                        grant.granteeUid == granteeUid &&
+                        grant.accessVector == accessVector
+                }
                 ?.let { return it.key }
             // Cap to 63 bits so Long.toUnsignedString reads the same as Long.toString.
             val grantId = (softwareGrantIdGen.getAndIncrement()) and 0x7fffffffffffffffL
-            softwareGrants[grantId] = SoftwareGrant(ownerKeyId, granteeUid)
+            softwareGrants[grantId] = SoftwareGrant(ownerKeyId, granteeUid, accessVector)
             return grantId
         }
 
@@ -1251,27 +1326,73 @@ class KeyMintSecurityLevelInterceptor(
         }
 
         /**
-         * Resolves a Domain.GRANT readback to the owner's KeyEntryResponse only
-         * when the caller is the recorded grantee. Returning the same response
-         * keeps the GRANT plane structurally indistinguishable from APP / KEY_ID
-         * for software keys. The grantee-UID guard prevents synthetic IDs from
-         * being mis-resolved when a real grantId issued by hardware keystore2
-         * happens to collide with our id space (vendor TAs and engineering-mode
-         * probes call getKeyEntry(GRANT, realGrantId) for grants we know
-         * nothing about; without the UID guard we would serve the wrong cached
-         * owner response and break legitimate vendor flows like Ultrasonic
-         * Fingerprint calibration hash retrieval).
+         * Result of resolving a Domain.GRANT readback against the synthetic
+         * `softwareGrants` table.
+         *
+         * - [Hit] — caller is the recorded grantee and holds GET_INFO; serve
+         *   the owner's KeyEntryResponse.
+         * - [PermissionDenied] — caller is the recorded grantee but the grant
+         *   does not include GET_INFO; reply with `PERMISSION_DENIED` the same
+         *   way real keystore2's permission.rs does.
+         * - [NotMine] — grantId is unknown OR the caller UID is not the
+         *   recorded grantee; the caller code should fall through to real
+         *   keystore2 instead of forging a reply.
          */
-        fun resolveGrantedResponse(grantId: Long, callingUid: Int): KeyEntryResponse? {
-            val grant = softwareGrants[grantId] ?: return null
+        sealed class GrantResolution {
+            data class Hit(val response: KeyEntryResponse) : GrantResolution()
+            object PermissionDenied : GrantResolution()
+            object NotMine : GrantResolution()
+        }
+
+        /**
+         * Resolves a Domain.GRANT readback. The grantee-UID guard prevents
+         * synthetic IDs from being mis-resolved when a real grantId issued by
+         * hardware keystore2 happens to collide with our id space (vendor TAs
+         * and engineering-mode probes call getKeyEntry(GRANT, realGrantId)
+         * for grants we know nothing about; without the UID guard we would
+         * serve the wrong cached owner response and break legitimate vendor
+         * flows like Ultrasonic Fingerprint calibration hash retrieval).
+         *
+         * The GET_INFO check mirrors real keystore2's
+         * permission.rs:check_grant_permission, which rejects getKeyEntry on
+         * a grant whose accessVector lacks the GET_INFO (0x4) bit. Duck
+         * Detector PR #57's "Grant access vector" probe issues a grant with
+         * only USE (0x100) and treats a successful grantee getKeyEntry as
+         * GET_KEY_ENTRY_WITHOUT_GET_INFO_ALLOWED. We surface
+         * PERMISSION_DENIED so the GRANT plane behaves like real keystore2
+         * for software-generated owner aliases too.
+         */
+        fun resolveGrant(grantId: Long, callingUid: Int): GrantResolution {
+            val grant = softwareGrants[grantId] ?: return GrantResolution.NotMine
             if (grant.granteeUid != callingUid) {
                 SystemLogger.debug(
                     "GRANT lookup grantId=$grantId by uid=$callingUid does not match " +
                         "recorded grantee uid=${grant.granteeUid}; forwarding."
                 )
-                return null
+                return GrantResolution.NotMine
             }
-            return getGeneratedKeyResponse(grant.ownerKeyId)
+            if ((grant.accessVector and KEY_PERMISSION_GET_INFO) == 0) {
+                SystemLogger.debug(
+                    "GRANT lookup grantId=$grantId by uid=$callingUid has accessVector=" +
+                        "0x${java.lang.Integer.toHexString(grant.accessVector)} (no GET_INFO); " +
+                        "rejecting like real keystore2 permission.rs."
+                )
+                return GrantResolution.PermissionDenied
+            }
+            val response = getGeneratedKeyResponse(grant.ownerKeyId)
+                ?: return GrantResolution.NotMine
+            return GrantResolution.Hit(response)
+        }
+
+        /**
+         * Compatibility shim used by older call-sites that only need the
+         * KeyEntryResponse on a Hit. Returns null on both NotMine and
+         * PermissionDenied; new call-sites should prefer [resolveGrant] so
+         * they can distinguish "not ours" (forward) from "denied" (forge a
+         * PERMISSION_DENIED reply).
+         */
+        fun resolveGrantedResponse(grantId: Long, callingUid: Int): KeyEntryResponse? {
+            return (resolveGrant(grantId, callingUid) as? GrantResolution.Hit)?.response
         }
 
         /**
