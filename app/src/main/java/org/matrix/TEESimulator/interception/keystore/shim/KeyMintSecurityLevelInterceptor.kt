@@ -553,7 +553,7 @@ class KeyMintSecurityLevelInterceptor(
                         callingUid, "android.permission.REQUEST_UNIQUE_ID_ATTESTATION",
                     )
                     if (!hasSELinux && !hasAndroid) {
-                        SystemLogger.info("[TX_ID: $txId] Stripping INCLUDE_UNIQUE_ID for uid=$callingUid pid=$callingPid (no permission)")
+                        SystemLogger.debug("[TX_ID: $txId] Stripping INCLUDE_UNIQUE_ID for uid=$callingUid pid=$callingPid (no permission)")
                         params = params.filter { it.tag != Tag.INCLUDE_UNIQUE_ID }.toTypedArray()
                         parsedParams = KeyMintAttestation(params)
                     }
